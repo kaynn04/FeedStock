@@ -1,0 +1,250 @@
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <ThreeWire.h>
+#include <RtcDS1302.h>
+#include <Servo.h>
+#include <ESP8266Firebase.h>
+#include <ESP8266WiFi.h>
+
+#define _SSID "POCO X5 5G"          // Your WiFi SSID
+#define _PASSWORD "2ezforKaynn"   // Your WiFi Password
+#define REFERENCE_URL "https://feedstock-718e1-default-rtdb.asia-southeast1.firebasedatabase.app/"  // Your Firebase project reference URL
+
+Firebase firebase(REFERENCE_URL);
+
+LiquidCrystal_I2C lcd(0x27, 16, 2); // LCD with I2C address 0x27
+ThreeWire myWire(D7, D6, D8);       // IO, SCLK, CE for DS1302
+RtcDS1302<ThreeWire> Rtc(myWire);
+Servo servo1;
+Servo servo2;
+
+struct Alarm {
+  int feedingHour;
+  int feedingMinute;
+};
+
+Alarm alarms[4]; // Array to hold 4 alarms
+
+const int buzzerPin1 = D13; // Digital pin connected to passive buzzer
+const int buzzDuration = 2000;
+
+int waterDuration;
+int feedDuration;
+int lastActivatedMinute = -1; // Track the last minute an alarm was activated
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(LED_BUILTIN, OUTPUT);
+  digitalWrite(LED_BUILTIN, LOW);
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  delay(1000);
+
+  pinMode(buzzerPin1, OUTPUT);
+  lcd.begin(); // Initialize the LCD
+  lcd.backlight();
+  lcd.clear();
+
+  // Connect to WiFi
+  Serial.println();
+  Serial.println();
+  lcd.clear(); // Clear the LCD display
+  lcd.setCursor(0, 0);
+  lcd.print("Connecting to:");
+  lcd.setCursor(0, 1);
+  lcd.print(_SSID);
+  WiFi.begin(_SSID, _PASSWORD);
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print("-");
+  }
+
+  Serial.println("");
+  lcd.clear(); // Clear the LCD display again
+  lcd.setCursor(0, 0);
+  lcd.print("WiFi Connected");
+  lcd.clear();
+
+  // Print the IP address
+  lcd.setCursor(0, 0);
+  lcd.print("IP Address:");
+  Serial.print("IP Address:");
+  Serial.print("http://");
+  Serial.print(WiFi.localIP());
+  lcd.setCursor(0, 1);
+  lcd.print(WiFi.localIP());
+  Serial.println("/");
+  digitalWrite(LED_BUILTIN, HIGH);
+
+  servo1.attach(D10); // Attach servo to pin D10
+  servo2.attach(D9);  // Attach servo to pin D9
+
+  // Set the servos to the initial position
+  servo1.write(0);
+  servo2.write(0);
+
+
+  delay(1000); // Give time for servos to stabilize
+
+  Rtc.Begin();
+
+  // Check if the RTC is running, if not set it to the compile time
+  if (!Rtc.IsDateTimeValid() || Rtc.GetIsWriteProtected() || !Rtc.GetIsRunning()) {
+    Serial.println("RTC not valid, setting date and time...");
+    Rtc.SetIsWriteProtected(false);
+    RtcDateTime currentTime = RtcDateTime(__DATE__, __TIME__);
+    Rtc.SetDateTime(currentTime);
+    Rtc.SetIsWriteProtected(true);
+  }
+
+  feedDuration = firebase.getInt("feedServo");
+  Serial.print("Received feedDuration:\t\t");
+  Serial.println(feedDuration);
+  waterDuration = firebase.getInt("waterServo");
+  Serial.print("Received waterDuration:\t\t");
+  Serial.println(waterDuration);
+
+  retrieveTime();
+
+  // Print the feeding times once at setup
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Feeding Times:");
+  for (int i = 0; i < 4; i++) {
+    lcd.setCursor(0, 1);
+    lcd.print(alarms[i].feedingHour > 12 ? alarms[i].feedingHour - 12 : alarms[i].feedingHour);
+    lcd.print(":");
+    if (alarms[i].feedingMinute < 10) lcd.print("0"); // Add leading zero if needed
+    lcd.print(alarms[i].feedingMinute);
+    lcd.print(alarms[i].feedingHour >= 12 ? " PM" : " AM");
+    delay(2500);
+  }
+}
+
+void loop() {
+  static unsigned long lastFetchTime = 0;
+  unsigned long currentTime = millis();
+
+  RtcDateTime now = Rtc.GetDateTime();
+
+  // Display current time
+  lcd.setCursor(0, 0);
+  lcd.print("Current Time:    ");
+  lcd.setCursor(0, 1);
+  lcd.print(now.Hour() > 12 ? now.Hour() - 12 : now.Hour());
+  lcd.print(":");
+  if (now.Minute() < 10) lcd.print("0"); // Add leading zero if needed
+  lcd.print(now.Minute());
+  lcd.print(":");
+  if (now.Second() < 10) lcd.print("0"); // Add leading zero if needed
+  lcd.print(now.Second());
+  lcd.print(now.Hour() >= 12 ? " PM" : " AM");
+
+  if (currentTime - lastFetchTime > 120000) {
+    feedDuration = firebase.getInt("feedServo");
+    Serial.print("Received feedDuration:\t\t");
+    Serial.println(feedDuration);
+    waterDuration = firebase.getInt("waterServo");
+    Serial.print("Received waterDuration:\t\t");
+    Serial.println(waterDuration);
+    lastFetchTime = currentTime;  
+
+    retrieveTime();
+  }
+
+  // Move the servo at the specified feeding times
+  if (now.Minute() != lastActivatedMinute) { // Only check alarms once per minute
+    for (int i = 0; i < 4; i++) {
+      if (now.Hour() == alarms[i].feedingHour && now.Minute() == alarms[i].feedingMinute) {
+        lcd.clear();
+        lcd.setCursor(0, 0);  
+        lcd.print("Feeding...");
+
+        unsigned long startTime = millis();
+        unsigned long maxDuration = max(feedDuration, waterDuration) * 1000;
+
+        // Start moving servos and sounding buzzer
+        servo1.attach(D10); // Re-attach the servo to ensure it is ready
+        servo2.attach(D9); // Re-attach the servo to ensure it is ready
+
+        while (millis() - startTime < maxDuration) {
+          // Move servo1 if within feedDuration
+          if (millis() - startTime < feedDuration * 1000) {
+            servo1.write(180); // Move servo1 to 180 degrees
+          } else {
+            servo1.write(25); // Return servo1 to 0 degrees
+          }
+
+          // Move servo2 if within waterDuration
+          if (millis() - startTime < waterDuration * 1000) {
+            servo2.write(180); // Move servo2 to 180 degrees
+          } else {
+            servo2.write(28); // Return servo2 to 0 degrees
+          }
+
+          // Sound buzzer continuously during any servo operation
+          tone(buzzerPin1, 2000); // Generate a continuous tone
+        }
+
+        noTone(buzzerPin1); // Stop the tone
+
+        // Detach servos to prevent jitter
+        servo1.write(25);
+        servo2.write(28);
+        servo1.detach();
+        servo2.detach();
+
+        lcd.setCursor(0, 1);
+        lcd.print("Done!");
+
+        lastActivatedMinute = now.Minute(); // Update the last activated minute
+        Serial.print("Alarm ");
+        Serial.print(i);
+        Serial.println(" activated.");
+      }
+    }
+  }
+  delay(500); // Update every 500 ms  
+}
+void retrieveTime() {
+  Serial.print("Retrieving Time data...");
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Retrieving Data.");
+
+  for (int i = 0; i < 4; i++) {
+    String timeString = firebase.getString("alarms/" + String(i));
+
+    // checking ng mga alarm na naka safe sa firebase
+    Serial.print("Received alarm ");
+    Serial.print(i);
+    Serial.print(": ");
+    Serial.println(timeString);
+
+    int separatorIndex = timeString.indexOf(':');
+    int spaceIndex = timeString.indexOf(' ');
+    if (timeString.substring(spaceIndex + 1) == "AM") {
+      alarms[i].feedingHour = timeString.substring(0, separatorIndex).toInt();
+    } else {	
+      if (timeString.substring(0, separatorIndex).toInt() == 12){
+        alarms[i].feedingHour = timeString.substring(0, separatorIndex).toInt();
+      } else {
+        alarms[i].feedingHour = timeString.substring(0, separatorIndex).toInt() + 12;
+      }
+    }
+    alarms[i].feedingMinute = timeString.substring(separatorIndex + 1, spaceIndex).toInt();
+
+    Serial.print("Alarm ");
+    Serial.print(i);
+    Serial.print(" parsed as: ");
+    Serial.print(alarms[i].feedingHour);
+    Serial.print(":");
+    Serial.println(alarms[i].feedingMinute);
+  }
+
+  Serial.println("Data successfully retrieved!");
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Data retrieved!");
+}
